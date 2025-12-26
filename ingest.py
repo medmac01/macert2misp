@@ -26,6 +26,24 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class IOCData:
+    """Indicators of Compromise extracted from maCERT PDF."""
+    ips: list = field(default_factory=list)
+    domains: list = field(default_factory=list)
+    file_paths: list = field(default_factory=list)
+    hashes: list = field(default_factory=list)
+    urls: list = field(default_factory=list)
+    
+    def has_iocs(self) -> bool:
+        """Check if any IOCs were found."""
+        return bool(self.ips or self.domains or self.file_paths or self.hashes or self.urls)
+    
+    def total_count(self) -> int:
+        """Return total number of IOCs."""
+        return len(self.ips) + len(self.domains) + len(self.file_paths) + len(self.hashes) + len(self.urls)
+
+
+@dataclass
 class VulnerabilityReport:
     """Parsed vulnerability report from maCERT PDF."""
     title: str = ""
@@ -39,8 +57,10 @@ class VulnerabilityReport:
     solution: str = ""
     risks: list = field(default_factory=list)
     external_references: list = field(default_factory=list)
+    iocs: IOCData = field(default_factory=IOCData)
     raw_text: str = ""
     source_file: str = ""
+    report_type: str = "vulnerability"  # vulnerability or malware
 
 
 class MaCERTParser:
@@ -90,6 +110,122 @@ class MaCERTParser:
         """Extract all URLs from text."""
         url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
         return list(set(re.findall(url_pattern, text)))
+    
+    def extract_ips(self, text: str) -> list:
+        """Extract IPv4 addresses from text."""
+        # Match IPv4 addresses, excluding common false positives
+        ip_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+        ips = re.findall(ip_pattern, text)
+        # Filter out version numbers and other non-IP patterns
+        valid_ips = [ip for ip in ips if not self._is_version_number(ip, text)]
+        return list(set(valid_ips))
+    
+    def _is_version_number(self, ip: str, text: str) -> bool:
+        """Check if an IP-like string is actually a version number."""
+        # Look for context around the IP that suggests it's a version
+        version_contexts = ['version', 'v' + ip, 'Version', ip + ' ;']
+        for ctx in version_contexts:
+            if ctx in text:
+                idx = text.find(ip)
+                if idx > 0:
+                    before = text[max(0, idx-20):idx].lower()
+                    if 'version' in before or before.rstrip().endswith('v'):
+                        return True
+        return False
+    
+    def extract_domains(self, text: str) -> list:
+        """Extract domain names from text."""
+        # Match domains (excluding common false positives)
+        domain_pattern = r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+(?:com|net|org|biz|info|xyz|me|cc|top|live|online|site|club|shop|app|dev|io|co|uk|sg|mx|ua|to|zapto)\b'
+        domains = re.findall(domain_pattern, text, re.IGNORECASE)
+        # Filter out email domains and known safe domains
+        safe_domains = {'macert.gov.ma', 'example.com'}
+        return list(set(d.lower() for d in domains if d.lower() not in safe_domains))
+    
+    def extract_hashes(self, text: str) -> list:
+        """Extract file hashes (MD5, SHA1, SHA256) from text."""
+        hashes = []
+        # SHA256 (64 hex chars)
+        sha256_pattern = r'\b[a-fA-F0-9]{64}\b'
+        hashes.extend([('sha256', h.lower()) for h in re.findall(sha256_pattern, text)])
+        # SHA1 (40 hex chars)
+        sha1_pattern = r'\b[a-fA-F0-9]{40}\b'
+        sha1_matches = re.findall(sha1_pattern, text)
+        # Filter out SHA256 substrings
+        sha256_set = set(h[1] for h in hashes)
+        for h in sha1_matches:
+            if not any(h.lower() in s for s in sha256_set):
+                hashes.append(('sha1', h.lower()))
+        # MD5 (32 hex chars)
+        md5_pattern = r'\b[a-fA-F0-9]{32}\b'
+        md5_matches = re.findall(md5_pattern, text)
+        existing = set(h[1] for h in hashes)
+        for h in md5_matches:
+            if h.lower() not in existing and not any(h.lower() in s for s in existing):
+                hashes.append(('md5', h.lower()))
+        return list(set(hashes))
+    
+    def extract_file_paths(self, text: str) -> list:
+        """Extract Windows file paths from text."""
+        paths = []
+        # Windows paths with environment variables
+        win_path_pattern = r'%[A-Za-z]+%(?:\\[^\s\n,;]+)+'
+        paths.extend(re.findall(win_path_pattern, text))
+        # Standard Windows paths
+        std_path_pattern = r'[A-Z]:\\(?:[^\s\n,;\\]+\\)*[^\s\n,;\\]+'
+        paths.extend(re.findall(std_path_pattern, text))
+        return list(set(paths))
+    
+    def extract_iocs_from_section(self, text: str) -> IOCData:
+        """Extract IOCs from the IOC section of the document."""
+        iocs = IOCData()
+        
+        # Find IOC section
+        ioc_section_match = re.search(
+            r'Indicateurs de compromission.*?(?:IOCs?)?\s*:?\s*(.*)$',
+            text, re.IGNORECASE | re.DOTALL
+        )
+        
+        if not ioc_section_match:
+            # No IOC section, try extracting from full text
+            return iocs
+        
+        ioc_text = ioc_section_match.group(1)
+        
+        # Extract IPs from IP section
+        ip_section = re.search(r'IP\s*:\s*(.+?)(?=Domains?\s*:|File paths?\s*:|Hashs?\s*:|URLs?\s*:|$)', 
+                               ioc_text, re.IGNORECASE | re.DOTALL)
+        if ip_section:
+            iocs.ips = self.extract_ips(ip_section.group(1))
+        
+        # Extract Domains from Domain section
+        domain_section = re.search(r'Domains?\s*:\s*(.+?)(?=IP\s*:|File paths?\s*:|Hashs?\s*:|URLs?\s*:|$)', 
+                                   ioc_text, re.IGNORECASE | re.DOTALL)
+        if domain_section:
+            # Extract domains line by line (they're listed with - prefix)
+            domain_text = domain_section.group(1)
+            domain_lines = re.findall(r'-\s*([^\s\n]+)', domain_text)
+            iocs.domains = list(set(d.strip() for d in domain_lines if '.' in d))
+        
+        # Extract File paths
+        filepath_section = re.search(r'File paths?\s*:\s*(.+?)(?=IP\s*:|Domains?\s*:|Hashs?\s*:|URLs?\s*:|$)', 
+                                     ioc_text, re.IGNORECASE | re.DOTALL)
+        if filepath_section:
+            iocs.file_paths = self.extract_file_paths(filepath_section.group(1))
+        
+        # Extract Hashes
+        hash_section = re.search(r'Hashs?\s*:\s*(.+?)(?=IP\s*:|Domains?\s*:|File paths?\s*:|URLs?\s*:|$)', 
+                                 ioc_text, re.IGNORECASE | re.DOTALL)
+        if hash_section:
+            iocs.hashes = self.extract_hashes(hash_section.group(1))
+        
+        # Extract URLs from URL section (if present)
+        url_section = re.search(r'URLs?\s*:\s*(.+?)(?=IP\s*:|Domains?\s*:|File paths?\s*:|Hashs?\s*:|$)', 
+                                ioc_text, re.IGNORECASE | re.DOTALL)
+        if url_section:
+            iocs.urls = self.extract_urls(url_section.group(1))
+        
+        return iocs
     
     def extract_list_items(self, text: str, start_marker: str, end_marker: str = None) -> list:
         """Extract bullet point items from a section."""
@@ -184,8 +320,34 @@ class MaCERTParser:
                     risks = re.findall(r'[•]\s*([^•\n]+)', risks_text)
                     report.risks = [r.strip().rstrip(';') for r in risks if r.strip()]
                 
-                # Extract References (URLs)
-                report.external_references = self.extract_urls(full_text)
+                # Extract References (URLs) - only from references section, not IOCs
+                refs_section = re.search(r'Références\s*(.+?)(?=Indicateurs|Direction Générale|$)', full_text, re.IGNORECASE | re.DOTALL)
+                if refs_section:
+                    report.external_references = self.extract_urls(refs_section.group(1))
+                else:
+                    report.external_references = self.extract_urls(full_text)
+                
+                # Determine report type based on content
+                if 'malware' in full_text.lower() or 'IOC' in full_text or 'Indicateurs de compromission' in full_text:
+                    report.report_type = 'malware'
+                
+                # Extract IOCs if present
+                report.iocs = self.extract_iocs_from_section(full_text)
+                
+                # If no structured IOC section but looks like malware report, try general extraction
+                if report.report_type == 'malware' and not report.iocs.has_iocs():
+                    # Try extracting from full text
+                    report.iocs.ips = self.extract_ips(full_text)
+                    report.iocs.hashes = self.extract_hashes(full_text)
+                    report.iocs.file_paths = self.extract_file_paths(full_text)
+                
+                # Also extract description for malware reports (different section name)
+                if not report.description:
+                    # For malware reports, description might be right after the header
+                    desc_match = re.search(r'Impact\s+\w+\s+(.+?)(?=Le maCERT|Indicateurs|Direction Générale)', 
+                                          full_text, re.IGNORECASE | re.DOTALL)
+                    if desc_match:
+                        report.description = desc_match.group(1).strip()
                 
         except Exception as e:
             logger.error(f"Error parsing PDF {pdf_path}: {e}")
@@ -202,7 +364,8 @@ class MaCERTParser:
             try:
                 report = self.parse_pdf(pdf_file)
                 reports.append(report)
-                logger.info(f"Successfully parsed: {report.title} ({len(report.cve_ids)} CVEs)")
+                ioc_count = report.iocs.total_count() if report.iocs else 0
+                logger.info(f"Successfully parsed: {report.title} ({len(report.cve_ids)} CVEs, {ioc_count} IOCs)")
             except Exception as e:
                 logger.error(f"Failed to parse {pdf_file}: {e}")
         
@@ -247,8 +410,15 @@ class MISPPublisher:
         
         # Add tags
         event.add_tag('tlp:green')
-        event.add_tag('type:vulnerability')
         event.add_tag('source:maCERT')
+        
+        # Add type-specific tags
+        if report.report_type == 'malware':
+            event.add_tag('type:malware')
+            if report.iocs.has_iocs():
+                event.add_tag('type:ioc')
+        else:
+            event.add_tag('type:vulnerability')
         
         if report.risk_level:
             event.add_tag(f'severity:{report.risk_level.lower()}')
@@ -315,7 +485,50 @@ Risks:
             attr.comment = 'maCERT bulletin reference'
             event.add_attribute(**attr)
         
+        # Add IOCs if present
+        if report.iocs and report.iocs.has_iocs():
+            self._add_iocs_to_event(event, report.iocs, report.title)
+        
         return event
+    
+    def _add_iocs_to_event(self, event: MISPEvent, iocs: IOCData, title: str):
+        """Add IOC objects and attributes to the MISP event."""
+        
+        # Add IP addresses
+        for ip in iocs.ips:
+            # Create network-connection object for each IP
+            ip_obj = MISPObject('ip-port')
+            ip_obj.add_attribute('ip', ip, to_ids=True, comment=f'C2 IP from {title}')
+            event.add_object(ip_obj)
+        
+        # Add domains
+        for domain in iocs.domains:
+            domain_obj = MISPObject('domain-ip')
+            domain_obj.add_attribute('domain', domain, to_ids=True, comment=f'Malicious domain from {title}')
+            event.add_object(domain_obj)
+        
+        # Add file hashes
+        if iocs.hashes:
+            for hash_type, hash_value in iocs.hashes:
+                file_obj = MISPObject('file')
+                file_obj.add_attribute(hash_type, hash_value, to_ids=True, comment=f'Malware hash from {title}')
+                event.add_object(file_obj)
+        
+        # Add file paths as attributes
+        for filepath in iocs.file_paths:
+            attr = MISPAttribute()
+            attr.type = 'filename'
+            attr.category = 'Artifacts dropped'
+            attr.value = filepath
+            attr.to_ids = True
+            attr.comment = f'Malware file path from {title}'
+            event.add_attribute(**attr)
+        
+        # Add malicious URLs
+        for url in iocs.urls:
+            url_obj = MISPObject('url')
+            url_obj.add_attribute('url', url, to_ids=True, comment=f'Malicious URL from {title}')
+            event.add_object(url_obj)
     
     def publish(self, report: VulnerabilityReport, publish: bool = False) -> dict:
         """Create and push a MISP event for a vulnerability report."""
@@ -398,19 +611,37 @@ def main():
         logger.warning("No PDF reports found to process")
         return
     
-    logger.info(f"Parsed {len(reports)} vulnerability reports")
+    logger.info(f"Parsed {len(reports)} reports")
     
     # Display parsed data
     for report in reports:
         print(f"\n{'='*60}")
         print(f"Title:       {report.title}")
+        print(f"Type:        {report.report_type.upper()}")
         print(f"Reference:   {report.reference}")
         print(f"Date:        {report.publication_date}")
         print(f"Risk:        {report.risk_level}")
         print(f"Impact:      {report.impact}")
-        print(f"CVEs:        {', '.join(report.cve_ids)}")
-        print(f"Systems:     {len(report.affected_systems)} affected")
-        print(f"References:  {len(report.external_references)} URLs")
+        if report.cve_ids:
+            print(f"CVEs:        {', '.join(report.cve_ids)}")
+        if report.affected_systems:
+            print(f"Systems:     {len(report.affected_systems)} affected")
+        if report.external_references:
+            print(f"References:  {len(report.external_references)} URLs")
+        
+        # Display IOC summary
+        if report.iocs and report.iocs.has_iocs():
+            print(f"\n  IOCs ({report.iocs.total_count()} total):")
+            if report.iocs.ips:
+                print(f"    IPs:         {len(report.iocs.ips)}")
+            if report.iocs.domains:
+                print(f"    Domains:     {len(report.iocs.domains)}")
+            if report.iocs.hashes:
+                print(f"    Hashes:      {len(report.iocs.hashes)}")
+            if report.iocs.file_paths:
+                print(f"    File Paths:  {len(report.iocs.file_paths)}")
+            if report.iocs.urls:
+                print(f"    URLs:        {len(report.iocs.urls)}")
         print(f"{'='*60}")
     
     if args.dry_run:

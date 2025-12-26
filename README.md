@@ -1,6 +1,6 @@
 # maCERT to MISP Ingestor
 
-Ingest maCERT (Morocco CERT) vulnerability bulletins from PDF format into MISP events.
+Ingest maCERT (Morocco CERT) vulnerability bulletins and malware reports from PDF format into MISP events.
 
 ## Features
 
@@ -15,12 +15,20 @@ Ingest maCERT (Morocco CERT) vulnerability bulletins from PDF format into MISP e
   - Description and solution
   - External references
 
+- **IOC Extraction**: Automatically extracts Indicators of Compromise from malware reports:
+  - IP addresses (IPv4)
+  - Domain names
+  - File hashes (MD5, SHA1, SHA256)
+  - File paths (Windows paths)
+  - Malicious URLs
+
 - **MISP Integration**: Creates properly structured MISP events with:
   - Vulnerability objects for each CVE
+  - IP-port objects for C2 IPs
+  - Domain-IP objects for malicious domains
+  - File objects for malware hashes
   - Security advisory details
-  - Affected system attributes
-  - External reference links
-  - Automatic tagging (TLP, severity, source)
+  - Automatic tagging (TLP, severity, source, type)
 
 ## Installation
 
@@ -102,13 +110,16 @@ Each bulletin creates a MISP event with:
 |-----------|-------------|
 | **Event Info** | `[maCERT] <Title> - <Reference>` |
 | **Threat Level** | Mapped from risk level (Critique→High, Important→Medium, etc.) |
-| **Tags** | `tlp:green`, `type:vulnerability`, `source:maCERT`, `severity:<level>` |
+| **Tags** | `tlp:green`, `type:vulnerability|malware|ioc`, `source:maCERT`, `severity:<level>` |
 | **Vulnerability Objects** | One per CVE with ID, summary, and references |
-| **Attributes** | Affected systems, external links, reference number |
+| **IP-Port Objects** | C2 IP addresses (for malware reports) |
+| **Domain-IP Objects** | Malicious domains (for malware reports) |
+| **File Objects** | Malware hashes with type (MD5/SHA1/SHA256) |
+| **Attributes** | Affected systems, external links, file paths, reference number |
 
-## Supported PDF Format
+## Supported PDF Formats
 
-This tool is designed for maCERT security bulletins which follow this structure:
+### Vulnerability Bulletins
 
 ```
 BULLETIN DE SECURITE
@@ -134,6 +145,41 @@ Solution
 Risque
 • <Risk 1>
 • <Risk 2>
+
+Références
+<URLs>
+```
+
+### Malware Reports with IOCs
+
+```
+NOTE DE SECURITE
+Titre               <Malware Name>
+Numéro de Référence <Reference ID>
+Date de Publication <DD Month YYYY>
+Risque              <Critique|Important>
+Impact              <Impact Level>
+
+<Description of the malware>
+
+Indicateurs de compromission (IOCs):
+
+IP :
+- 1.2.3.4
+- 5.6.7.8
+
+Domains :
+- malicious-domain.com
+- evil-site.net
+
+File paths:
+- %TEMP%\malware.exe
+- %WinDir%\System32\backdoor.dll
+
+Hashs :
+- <SHA256 hashes>
+- <MD5 hashes>
+```
 
 Références
 <URLs>
