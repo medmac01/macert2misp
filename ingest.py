@@ -534,21 +534,38 @@ Risks:
         """Create and push a MISP event for a vulnerability report."""
         try:
             event = self.create_event(report)
-            result = self.misp.add_event(event)
+            result = self.misp.add_event(event, pythonify=True)
             
-            if 'errors' in result:
-                logger.error(f"MISP error: {result['errors']}")
-                return result
+            # Handle different response formats
+            event_id = None
             
-            event_id = result['Event']['id']
-            logger.info(f"Created MISP event {event_id}: {report.title}")
+            if isinstance(result, MISPEvent):
+                # PyMISP returns a MISPEvent object when pythonify=True
+                event_id = result.id
+            elif isinstance(result, dict):
+                if 'errors' in result:
+                    logger.error(f"MISP error: {result['errors']}")
+                    return result
+                if 'Event' in result:
+                    event_id = result['Event'].get('id')
+                elif 'id' in result:
+                    event_id = result.get('id')
+                # Check if we got the API description page (wrong URL/protocol)
+                if 'url' in result and '/events/add' in result.get('url', ''):
+                    logger.error("MISP returned API description. Check your URL (use https:// instead of http://)")
+                    return {'errors': 'Wrong protocol or URL - MISP returned API description instead of event'}
+            
+            if event_id:
+                logger.info(f"Created MISP event {event_id}: {report.title}")
+            else:
+                logger.warning(f"Event may have been created but could not determine ID for: {report.title}")
             
             # Optionally publish the event
-            if publish:
+            if publish and event_id:
                 self.misp.publish(event_id)
                 logger.info(f"Published MISP event {event_id}")
             
-            return result
+            return {'Event': {'id': event_id}, 'success': True}
             
         except Exception as e:
             logger.error(f"Failed to publish to MISP: {e}")
@@ -663,10 +680,19 @@ def main():
     for report in reports:
         try:
             result = publisher.publish(report, publish=args.publish)
-            if 'Event' in result:
-                print(f"✓ Created event {result['Event']['id']}: {report.title}")
+            # Handle different response formats
+            event_id = None
+            if isinstance(result, dict) and 'Event' in result:
+                event_id = result['Event'].get('id')
+            elif hasattr(result, 'id'):
+                event_id = result.id
+            
+            if event_id:
+                print(f"✓ Created event {event_id}: {report.title}")
+            elif 'errors' in result if isinstance(result, dict) else False:
+                print(f"✗ Failed to create event for: {report.title} - {result.get('errors')}")
             else:
-                print(f"✗ Failed to create event for: {report.title}")
+                print(f"? Event created but ID unknown: {report.title}")
         except Exception as e:
             print(f"✗ Error processing {report.title}: {e}")
 
