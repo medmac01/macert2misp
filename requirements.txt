@@ -1,0 +1,4 @@
+# maCERT to MISP Ingestor Dependencies
+pdfplumber>=0.10.0
+pymisp>=2.4.170
+python-dateutil>=2.8.0
